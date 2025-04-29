@@ -1,0 +1,534 @@
+import pygame
+import time
+import random
+import math
+import torch
+import torch.nn as nn #lib for building neural networks
+import torch.nn.functional as F #lib for forward propagation
+from torch.distributions import Categorical
+import numpy as np
+
+class PongAI(nn.Module):
+    def __init__(self, states = 9, hidden = 10, actions = 3, training = True):
+        super().__init__() #instantiate nn.Module
+        self.fcl = nn.Linear(states, hidden, bias=False)
+        self.out = nn.Linear(hidden, actions, bias=False)
+        self.statesize = states
+        self.training = training #bool to indicate training or evaluating
+        self.LossFn = nn.CrossEntropyLoss() #create loss function attribute
+
+    def forward(self, x):
+        x = self.fcl(x)
+        x = F.relu(x)
+        x = self.out(x)
+
+        return x
+    
+    def samplingaction(self, raw_output_tensor):
+        if (self.training == True): #training
+            distribution = Categorical(logits=raw_output_tensor)
+            action = distribution.sample()
+        else: #evaluating
+            action = torch.argmax(raw_output_tensor)
+        
+        return action
+
+    def learn(self, reward, reset):
+        #create optimizer object
+        if (reward == True): 
+            optim = torch.optim.Adam(self.parameters(), lr=0.002)
+        else:
+            optim = torch.optim.Adam(self.parameters(), lr=0.004, maximize=True)
+        
+        if (reset == False):
+            optim.step() #update NN
+
+        optim.zero_grad() #clear NN gradient
+    
+    def lossvalue(self,logits,target):
+        Pred = [logits] #wrap logits tensor in list
+        Pred = torch.stack(Pred, dim=0) #reformat into nested tensor
+        Loss = self.LossFn(Pred,torch.LongTensor([target]))
+
+        return Loss
+
+    def policy_gradient(self, reward, hit):
+        good = True #flag var indicating encourage or discourage
+
+        if (reward < 0):
+            good = False
+        #create optimizer object
+        if (good == True):
+            lr = (reward + 1)*0.001
+            optim = torch.optim.Adam(self.parameters(), lr=lr)
+        else:
+            lr = (abs(reward))*0.001
+            optim = torch.optim.Adam(self.parameters(), lr=lr, maximize=True)
+
+        if (good == False or hit == True):    
+            optim.step() #update NN
+
+        optim.zero_grad() #clear NN gradient
+
+#Agent objects
+left_AI = PongAI()
+right_AI = PongAI()
+#load tensor weights
+left_AI.load_state_dict(torch.load('left_paddle_AI.pt', weights_only=True))
+right_AI.load_state_dict(torch.load('right_paddle_AI.pt', weights_only=True))
+#canvas dimensions
+width = 1000
+height = 600
+#game objects
+pad_width = 20
+pad_length = 80
+speed = 0.5
+#left paddle
+left_x = 30
+left_y = 0.5*height
+left_prev_y = 0.5*height
+left_frozen = False
+left_dir = 'S'
+left_hit = False
+left_reward = 0
+#right paddle
+right_x = 950
+right_y = 0.5*height
+right_prev_y = 0.5*height
+right_frozen = False
+right_dir = 'S'
+right_hit = False
+right_reward = 0
+#ball
+ball_pos = [0,0]
+ball_prev_pos = [0,0]
+ball_radius = 15
+ball_dir = 'S'
+#bomb
+bomb_pos = [0,0]
+bomb_prev_pos = [0,0]
+bomb_radius = 30
+bomb_dir = 'S'
+bomb_status = False
+bombx_locations = [0.3*width, 0.5*width, 0.7*width]
+bomby_locations = [-1*bomb_radius, height + bomb_radius]
+bomb_speed = 0.2
+#rally terminal signal
+done = False
+#variables for measuring time
+prev_frame_time = 0 #measure time btw adjacent frame
+left_frozen_time = 0 #measure left paddle frozen time
+right_frozen_time = 0 #measure right paddle frozen time
+bomb_spawn_time = 0 #measure bomb spawn time
+dt = 0
+#initializing pygames
+pygame.init()
+screen = pygame.display.set_mode((width,height))
+
+#function used to handle ball collision
+def ball_collisions():
+    #declare global variables
+    #left paddle
+    global left_x
+    global left_y
+    global left_dir
+    global left_hit
+    global left_reward
+    #right paddle
+    global right_x
+    global right_y
+    global right_dir 
+    global right_hit
+    global right_reward   
+    #ball
+    global ball_pos
+    global ball_dir
+    global ball_radius
+    #other parameters
+    global width
+    global height
+    global pad_length
+    global pad_width
+    global done
+
+    #left paddle
+    if ((left_x <= ball_pos[0] and ball_pos[0] <= left_x + pad_width) and (left_y <= ball_pos[1] and ball_pos[1] <= left_y + pad_length) and (ball_dir == 'L' or ball_dir == 'LU' or ball_dir =='LD')):
+        left_AI.learn(reward=True,reset=False) #reward return  
+        #update ball direction    
+        if (left_dir == 'U'):
+            ball_dir = 'RU'
+        elif (left_dir == 'D'):
+            ball_dir = 'RD'
+        else:
+            ball_dir = 'R'
+        #register paddle hit
+        #if (left_hit == False): 
+        #    left_hit = True
+        
+    #right paddle
+    if ((right_x <= ball_pos[0] and ball_pos[0] <= right_x + pad_width) and (right_y <= ball_pos[1] and ball_pos[1] <= right_y + pad_length) and (ball_dir == 'R' or ball_dir == 'RU' or ball_dir == 'RD')):
+        right_AI.learn(reward=True,reset=False) #reward return
+        #update ball direction
+        if (right_dir == 'U'):
+            ball_dir = 'LU'
+        elif (right_dir == 'D'):
+            ball_dir = 'LD'
+        else:
+            ball_dir = 'L'
+        #register paddle hit
+        #if (right_hit == False): 
+        #    right_hit = True
+
+    #ceiling
+    if (ball_pos[1] - ball_radius <= 0):
+        if (ball_dir == 'LU'):
+            ball_dir = 'LD'
+        elif (ball_dir == 'RU'):
+            ball_dir = 'RD'
+    #floor
+    if (ball_pos[1] + ball_radius >= height):
+        if (ball_dir == 'LD'):
+            ball_dir = 'LU'
+        elif (ball_dir == 'RD'):
+            ball_dir = 'RU'
+    #left scores
+    if (ball_pos[0] + ball_radius >= width):
+        left_AI.learn(reward=True,reset=True) #clear gradient
+        right_AI.learn(reward=False,reset=False) #punish miss
+        done = True
+    #right scores
+    if (ball_pos[0] - ball_radius <= 0):
+        left_AI.learn(reward=False,reset=False) #punish miss
+        right_AI.learn(reward=True,reset=True) #clear gradient
+        done = True
+
+#function used to spawn bomb
+def spawnbomb():
+    #declare global variables
+    global bomb_pos
+    global bomb_dir
+    global bomb_status
+    global bombx_locations
+    global bomby_locations
+
+    bomb_status = True #update bomb active status
+    bomb_pos[0] = bombx_locations[random.randrange(0,3)] #set bomb x position
+    bomb_pos[1] = bomby_locations[random.randrange(0,2)] #set bomb y position
+
+    if (bomb_pos[1] < 0):
+        bomb_directions = ['D','LD','RD']
+        bomb_dir = bomb_directions[random.randrange(0,3)]
+    else:
+        bomb_directions = ['U','LU','RU']
+        bomb_dir = bomb_directions[random.randrange(0,3)]
+
+#function used to update object positions + bomb status
+def logic():
+    #declare global variables
+    #left paddle
+    global left_y
+    global left_dir
+    global left_frozen
+    global left_frozen_time
+    #right paddle
+    global right_y
+    global right_dir
+    global right_frozen
+    global right_frozen_time
+    #ball
+    global ball_pos
+    global ball_dir
+    #bomb
+    global bomb_pos
+    global bomb_dir
+    global bomb_status
+    global bomb_radius
+    global bomb_spawn_time
+    global bomb_speed
+    #other parameters
+    global speed
+    global dt
+    global height
+    global pad_length
+
+    #left paddle
+    if (left_frozen == False):
+        if (left_dir == 'U'):
+            if (left_y > 0):
+                left_y = left_y - dt*speed
+        elif (left_dir == 'D'):
+            if (left_y + pad_length < height):
+                left_y = left_y + dt*speed
+    #right paddle
+    if (right_frozen == False):
+        if (right_dir == 'U'):
+            if (right_y > 0):
+                right_y = right_y - dt*speed
+        elif (right_dir == 'D'):
+            if (right_y + pad_length < height):
+                right_y = right_y + dt*speed
+    #ball
+    if (ball_dir == 'L'):
+        ball_pos[0] = ball_pos[0] - dt*speed
+    elif (ball_dir == 'LU'):
+        ball_pos[0] = ball_pos[0] - dt*speed
+        ball_pos[1] = ball_pos[1] - dt*speed
+    elif (ball_dir == 'LD'):
+        ball_pos[0] = ball_pos[0] - dt*speed
+        ball_pos[1] = ball_pos[1] + dt*speed
+    elif (ball_dir == 'R'):
+        ball_pos[0] = ball_pos[0] + dt*speed
+    elif (ball_dir == 'RU'):
+        ball_pos[0] = ball_pos[0] + dt*speed
+        ball_pos[1] = ball_pos[1] - dt*speed
+    elif (ball_dir == 'RD'):
+        ball_pos[0] = ball_pos[0] + dt*speed
+        ball_pos[1] = ball_pos[1] + dt*speed
+    #bomb
+    if (bomb_status == True):
+        #record bomb object prev position before update
+        bomb_prev_pos[0] = bomb_pos[0]
+        bomb_prev_pos[1] = bomb_pos[1]
+
+        #update bomb position
+        if (bomb_dir == 'U'):
+            bomb_pos[1] = bomb_pos[1] - dt*bomb_speed
+        elif (bomb_dir == 'LU'):
+            bomb_pos[0] = bomb_pos[0] - dt*bomb_speed
+            bomb_pos[1] = bomb_pos[1] - dt*bomb_speed
+        elif (bomb_dir == 'LD'):
+            bomb_pos[0] = bomb_pos[0] - dt*bomb_speed
+            bomb_pos[1] = bomb_pos[1] + dt*bomb_speed
+        elif (bomb_dir == 'D'):
+            bomb_pos[1] = bomb_pos[1] + dt*bomb_speed
+        elif (bomb_dir == 'RU'):
+            bomb_pos[0] = bomb_pos[0] + dt*bomb_speed
+            bomb_pos[1] = bomb_pos[1] - dt*bomb_speed
+        elif (bomb_dir == 'RD'):
+            bomb_pos[0] = bomb_pos[0] + dt*bomb_speed
+            bomb_pos[1] = bomb_pos[1] + dt*bomb_speed
+        #check for ball-bomb collision
+        bomb_collision = False #local flag variable indicating ball-bomb collision
+        distance = ((bomb_pos[0] - ball_pos[0])**2) + ((bomb_pos[1] - ball_pos[1])**2)
+        distance = distance**(1/2)
+        if (distance <= 1.1*bomb_radius): #if bomb collides with ball -> freeze corresponding paddle
+            bomb_collision = True
+            if (ball_dir == 'L' or ball_dir == 'LU' or ball_dir == 'LD'):
+                right_frozen = True #freeze right paddle
+                right_frozen_time = time.perf_counter() #start timer in seconds
+            else:
+                left_frozen = True #freeze left paddle
+                left_frozen_time = time.perf_counter() #start timer in seconds
+        if ((bomb_pos[1] < -1*bomb_radius) or (bomb_pos[1] > (bomb_radius + height)) or bomb_collision == True): #update bomb active status
+            bomb_status = False #update bomb active status
+            bomb_spawn_time = time.perf_counter() #start bomb spawn timer in seconds
+
+#function used to draw the game objects
+def render():
+    global screen
+    screen.fill((0,0,0)) #fill screen background
+    #draw game objects
+    global pad_width
+    global pad_length
+    global left_x
+    global left_y
+    global right_x
+    global right_y
+    global ball_pos
+    global ball_radius
+    pygame.draw.rect(screen,(0,0,255),(left_x,left_y,pad_width,pad_length)) #draw left paddle
+    pygame.draw.rect(screen,(0,0,255),(right_x,right_y,pad_width,pad_length)) #draw right paddle
+    pygame.draw.circle(screen,(0,255,0),(ball_pos[0],ball_pos[1]),ball_radius) #draw ball
+
+    global bomb_status
+    if (bomb_status == True):
+        global bomb_pos
+        global bomb_radius
+        pygame.draw.circle(screen,(255,0,0),(bomb_pos[0],bomb_pos[1]),bomb_radius) #draw bomb
+
+    pygame.display.flip() #update screen contents
+
+#function used to reset game states
+def reset():
+    global width
+    global height
+    global done
+    global prev_frame_time
+    #left paddle
+    global left_y
+    global left_prev_y
+    global left_dir
+    global left_frozen
+    global left_hit
+    global left_reward
+    left_dir = 'S'
+    left_frozen = False
+    left_y = left_prev_y = 0.5*height
+    left_hit = False
+    left_reward = 0
+    #right paddle
+    global right_y
+    global right_prev_y
+    global right_dir
+    global right_frozen 
+    global right_hit
+    global right_reward
+    right_dir = 'S' 
+    right_frozen = False
+    right_y = right_prev_y = 0.5*height
+    right_hit = False
+    right_reward = 0
+    #ball
+    global ball_dir
+    ball_pos[0] = ball_prev_pos[0] = 0.5*width
+    ball_pos[1] = ball_prev_pos[1] = random.randrange(math.floor(0.1*height),math.floor(0.9*height))
+    ball_directions = ['L','LU','LD','R','RU','RD']
+    ball_dir = ball_directions[random.randrange(0,6)]
+    #bomb
+    global bomb_status
+    global bomb_spawn_time
+    bomb_status = False
+    bomb_spawn_time = time.perf_counter()
+    #done signal
+    done = False
+    #measure frame time
+    prev_frame_time = time.time_ns()
+ 
+#function used to hot encode object velocity
+def foo(number):
+    if (number > 0):
+        return 1.0
+    elif (number < 0):
+        return -1.0
+    else:
+        return 0.0
+
+#function used to obtain normalized state vector -> flag variable indicates left or right paddle AI
+def GetGameStates(left = True):
+    #declare global variables
+    global left_y
+    global left_prev_y
+    global right_y
+    global right_prev_y
+    global width
+    global height
+    states = np.zeros(9) #create states array
+    x_scale = width/2
+    y_scale = height/2
+
+    if (left == True):
+        global left_frozen
+        states[0] = (left_y - y_scale)/y_scale
+        states[1] = foo(left_y - left_prev_y)
+        states[2] = left_frozen
+        states[3] = (right_y - y_scale)/y_scale
+        states[4] = foo(right_y - right_prev_y)
+    else:
+        global right_frozen
+        states[0] = (right_y - y_scale)/y_scale
+        states[1] = foo(right_y - right_prev_y)
+        states[2] = right_frozen
+        states[3] = (left_y - y_scale)/y_scale
+        states[4] = foo(left_y - left_prev_y)
+
+    states[5] = (ball_pos[0] - x_scale)/x_scale
+    states[6] = (ball_pos[1] - y_scale)/y_scale
+    states[7] = foo(ball_pos[0] - ball_prev_pos[0])
+    states[8] = foo(ball_pos[1] - ball_prev_pos[1])
+
+    return states
+
+num_of_episodes = 50 #number episodes/rallies to run
+quit = False #variable used to quit training/simulation loop
+episode = 0 #variable used to keep track of episode count
+LeftLoss = 0 #Loss value for left AI
+RightLoss = 0 #Loss value for right AI
+
+while (quit == False and episode != num_of_episodes): #training/simulation loop
+    reset() #reset the state of the game
+    print('episode -> ',episode)
+
+    while (done == False): #episode/rally loop
+        ball_collisions() #call ball_collision first to check if someone scored
+
+        if (done == False):
+            #MEASURE TIME
+            cur_frame_time = time.time_ns() #records current time instance in nanoseconds
+            dt = (cur_frame_time - prev_frame_time)*(10**-6) #calculate time btw frames and convert nanoseconds to milliseconds
+            prev_frame_time = cur_frame_time #update prev frame time 
+            #left paddle freeze time
+            if (left_frozen == True):
+                t = time.perf_counter()
+                if ((t - left_frozen_time) >= 2):
+                    left_frozen = False
+            #right paddle freeze time
+            if (right_frozen == True):
+                t = time.perf_counter()
+                if ((t - right_frozen_time) >= 2):
+                    right_frozen = False
+            #bomb spawn time
+            if (bomb_status == False):
+                t = time.perf_counter()
+                if ((t - bomb_spawn_time) >= 2):
+                    spawnbomb()
+
+            #INPUT
+            #get game states
+            left_states = GetGameStates()
+            right_states = GetGameStates(False)
+            #forward propogation + remember numpy -> tensor conversion
+            left_logit = left_AI.forward(torch.FloatTensor(left_states))
+            right_logit = right_AI.forward(torch.FloatTensor(right_states))
+            #sample action + remember tensor -> scalar conversion
+            left_action = left_AI.samplingaction(left_logit).item()
+            right_action = right_AI.samplingaction(right_logit).item()
+            #obtain loss values
+            LeftLoss = left_AI.lossvalue(left_logit,left_action)
+            RightLoss = right_AI.lossvalue(right_logit,right_action)
+            #obtain and accumulate gradient for decision
+            LeftLoss.backward()
+            RightLoss.backward()
+
+            #record observation + action into buffer
+            #left_AI.storebuffer(left_states,left_action)
+            #right_AI.storebuffer(right_states,right_action)
+
+            #update paddle direction based on AI actions
+            if (left_action == 0):
+                left_dir = 'S'
+            elif (left_action == 1):
+                left_dir = 'U'
+            else:
+                left_dir = 'D'
+            if (right_action == 0):
+                right_dir = 'S'
+            elif (right_action == 1):
+                right_dir = 'U'
+            else:
+                right_dir = 'D'
+
+            #UPDATE
+            #record previous game object positions before logic() updates, bomb prev states can be done inside logic() bomb portion
+            left_prev_y = left_y #left paddle prev
+            right_prev_y = right_y #right paddle prev
+            #ball prev
+            ball_prev_pos[0] = ball_pos[0]
+            ball_prev_pos[1] = ball_pos[1]
+            logic()
+
+            #RENDER
+            render()
+    
+    #LEARNING
+    #left_AI.policy_gradient(left_reward, left_hit)
+    #right_AI.policy_gradient(right_reward, right_hit)
+    episode = episode + 1 #update episode count 
+
+    #left_AI.learn(left_reward) #left AI 
+    #right_AI.learn(right_reward) #right AI
+     
+#save the model parameters
+torch.save(left_AI.state_dict(), 'left_paddle_AI.pt') #left paddle
+torch.save(right_AI.state_dict(), 'right_paddle_AI.pt') #right paddle
+print('finished simulation')
+
